@@ -76,6 +76,22 @@ function initialize_viewer() {
   controls.enableDamping = true;
   controls.dampingFactor = 0.25;
   controls.enableZoom = true;
+
+  // Keep the camera frustum and renderer in sync with the canvas size, otherwise
+  // the picking ray is computed against a stale viewport and clicks land off-target.
+  window.addEventListener("resize", onWindowResize);
+}
+
+function onWindowResize() {
+  canvas_width = canvas.getBoundingClientRect().width;
+  canvas_height = canvas.getBoundingClientRect().height;
+  camera.left = canvas_width / -800;
+  camera.right = canvas_width / 800;
+  camera.top = canvas_height / 800;
+  camera.bottom = canvas_height / -800;
+  camera.updateProjectionMatrix();
+  renderer.setSize(canvas_width, canvas_height);
+  controls.handleResize();
 }
 
 // Point cloud loader
@@ -85,7 +101,8 @@ async function loadPointCloud(ply_path) {
   var positions = data.xyz;
   var colors = data.rgb;
   var material = new THREE.PointsMaterial({
-    size: 10,
+    size: 3.0,
+    sizeAttenuation: false, // size in pixels: crisp dots regardless of scene scale -> precise picking
     vertexColors: true,
   });
 

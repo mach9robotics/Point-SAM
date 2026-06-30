@@ -1,16 +1,18 @@
+import argparse
+import os
+
 import hydra
-from omegaconf import OmegaConf
-from flask import Flask, jsonify, request
-from flask_cors import CORS
-from utils import load_ply
 import numpy as np
 import torch
-import os
-import numpy as np
-import argparse
+from flask import Flask, jsonify, request
+from flask_cors import CORS
+from omegaconf import OmegaConf
+from scipy.spatial import cKDTree
+
+from utils import load_ply
 from pc_sam.model.pc_sam import PointCloudSAM
 from pc_sam.utils.torch_utils import replace_with_fused_layernorm
-from pc_sam.model.loss import compute_iou
+from pc_sam.scene_inference import TiledSceneSAM
 from safetensors.torch import load_model
 
 parser = argparse.ArgumentParser()
@@ -21,58 +23,84 @@ parser.add_argument("--pointcloud", type=str, default="scene.ply")
 parser.add_argument(
     "--num_points",
     type=int,
-    default=100000,
-    help="randomly subsample the cloud to at most this many points (GPU/browser limit)",
+    default=200000,
+    help="number of points sent to the browser for DISPLAY (not a model limit; "
+    "the full cloud is always encoded via tiling)",
 )
 parser.add_argument(
-    "--config", type=str, default="large", help="path to config file"
+    "--max_core_points",
+    type=int,
+    default=150000,
+    help="max points per encoded tile (kd-split cap); smaller = finer/safer VRAM",
 )
+parser.add_argument("--overlap", type=float, default=0.1, help="tile halo fraction")
+parser.add_argument("--config", type=str, default="large", help="path to config file")
 parser.add_argument("--config_dir", type=str, default="../configs")
-parser.add_argument(
-    "--ckpt_path",
-    type=str,
-    default="./pretrained/ours/mixture_10k_giant/model.safetensors",
-)
 args = parser.parse_args()
 
-# PCSAM variables
-pc_xyz, pc_rgb = None, None
-prompts, labels = [], []
-prompt_mask = None
-obj_path = None
 output_dir = "results"
-segment_mask = None
-masks = []
-
-# Flask Backend
-app = Flask(__name__, static_folder="static")
-CORS(
-    app, origins=f"{args.host}:{args.port}", allow_headers="Access-Control-Allow-Origin"
-)
-
-# change "./pretrained/model.safetensors" to the path of the checkpoint
-
-# ---------------------------------------------------------------------------- #
-# Load configuration
-# ---------------------------------------------------------------------------- #
-with hydra.initialize(args.config_dir, version_base=None):
-    cfg = hydra.compose(config_name=args.config)
-    OmegaConf.resolve(cfg)
-    # print(OmegaConf.to_yaml(cfg))
-
 
 # ---------------------------------------------------------------------------- #
 # Setup model
 # ---------------------------------------------------------------------------- #
+with hydra.initialize(args.config_dir, version_base=None):
+    cfg = hydra.compose(config_name=args.config)
+    OmegaConf.resolve(cfg)
+
 model = hydra.utils.instantiate(cfg.model)
 model.apply(replace_with_fused_layernorm)
-
-# ---------------------------------------------------------------------------- #
-# Load pre-trained model
-# ---------------------------------------------------------------------------- #
 load_model(model, args.checkpoint)
 model.eval().cuda()
-sam = model
+
+# ---------------------------------------------------------------------------- #
+# Load the FULL-resolution cloud and encode it as cached spatial tiles.
+# This replaces the old "globally subsample then encode" path: every point is
+# encoded (no points discarded), within bounded VRAM, and each click reuses the
+# cached per-tile embedding (see pc_sam/scene_inference.py).
+# ---------------------------------------------------------------------------- #
+def _resolve_cloud(p):
+    if os.path.exists(p):
+        return p
+    return os.path.join(os.path.dirname(__file__), "static", "models", p)
+
+src = _resolve_cloud(args.pointcloud)
+obj_path = os.path.basename(args.pointcloud)
+print(f"[load] {src}", flush=True)
+points = load_ply(src)
+xyz_world = points[:, :3].astype(np.float64)
+rgb01 = (points[:, 3:6] / 255).astype(np.float32)
+print(f"[load] {xyz_world.shape[0]} points; encoding tiles ...", flush=True)
+
+segmenter = TiledSceneSAM(
+    model,
+    max_core_points=args.max_core_points,
+    overlap=args.overlap,
+)
+segmenter.encode_scene(xyz_world, rgb01)
+segmenter.new_session()
+
+# Display subsample: the browser cannot render millions of points. We render a
+# subset, but segmentation runs on the full cloud and is mapped back to it.
+N = xyz_world.shape[0]
+if N > args.num_points:
+    disp_idx = np.sort(np.random.choice(N, args.num_points, replace=False))
+else:
+    disp_idx = np.arange(N)
+disp_world = xyz_world[disp_idx]
+disp_rgb = rgb01[disp_idx]
+_dshift = disp_world.mean(0)
+_dscale = max(float(np.linalg.norm(disp_world - _dshift, axis=1).max()), 1e-8)
+disp_norm = ((disp_world - _dshift) / _dscale).astype(np.float32)  # browser frame
+disp_tree = cKDTree(disp_norm)  # map browser clicks (normalized) -> displayed point
+print(f"[display] sending {len(disp_idx)} of {N} points to the browser", flush=True)
+
+# session state
+cur_full_mask = None          # latest [N] bool mask
+saved_masks = []              # list of [N] bool masks (one per confirmed object)
+
+# Flask Backend
+app = Flask(__name__, static_folder="static")
+CORS(app, origins=f"{args.host}:{args.port}", allow_headers="Access-Control-Allow-Origin")
 
 
 @app.route("/")
@@ -87,131 +115,73 @@ def static_server(path):
 
 @app.route("/mesh/<path:path>")
 def mesh_server(path):
-    # path = f"/home/yuchen/workspace/annotator_3d/src/static/models/{path}"
-    # print(path)
-    # path = "/home/yuchen/workspace/annotator_3d/src/static/models/Rhino/White Rhino.obj"
-    path = f"models/{path}"
-    print(path)
-    return app.send_static_file(path)
-
-
-@app.route("/sampled_pointcloud", methods=["POST"])
-def sampled_pc():
-    request_data = request.get_json()
-    points = request_data["points"].values()
-    points = np.array(list(points)).reshape(-1, 3)
-    colors = request_data["colors"].values()
-    colors = np.array(list(colors)).reshape(-1, 3)
-
-    global pc_xyz, pc_rgb
-    pc_xyz, pc_rgb = (
-        torch.from_numpy(points).cuda().float(),
-        torch.from_numpy(colors).cuda().float(),
-    )
-    pc_xyz, pc_rgb = pc_xyz.unsqueeze(0), pc_rgb.unsqueeze(0)
-
-    response = "success"
-    return jsonify({"response": response})
+    return app.send_static_file(f"models/{path}")
 
 
 @app.route("/pointcloud/<path:path>")
 def pointcloud_server(path):
-    global obj_path, pc_xyz, pc_rgb
-
-    # Resolve the cloud path: use --pointcloud as given if it exists (absolute or
-    # relative to cwd), otherwise fall back to the bundled demo/static/models dir.
-    src = args.pointcloud
-    if not os.path.exists(src):
-        src = os.path.join(os.path.dirname(__file__), "static", "models", args.pointcloud)
-    obj_path = os.path.basename(args.pointcloud)
-
-    points = load_ply(src)
-    xyz = points[:, :3]
-    rgb = points[:, 3:6] / 255
-
-    # Subsample large clouds (e.g. multi-million-point LiDAR) to keep the encoder
-    # within GPU memory and the browser payload manageable.
-    if xyz.shape[0] > args.num_points:
-        indices = np.random.choice(xyz.shape[0], args.num_points, replace=False)
-        xyz = xyz[indices]
-        rgb = rgb[indices]
-    print(f"[pointcloud] {src}: serving {xyz.shape[0]} points")
-
-    # normalize to a unit sphere centered at the origin
-    shift = xyz.mean(0)
-    scale = np.linalg.norm(xyz - shift, axis=-1).max()
-    xyz = (xyz - shift) / scale
-
-    # set pcsam variables (kept aligned with what we send to the browser)
-    pc_xyz = torch.from_numpy(xyz).cuda().float().unsqueeze(0)
-    pc_rgb = torch.from_numpy(rgb).cuda().float().unsqueeze(0)
-
-    return jsonify({"xyz": xyz.flatten().tolist(), "rgb": rgb.flatten().tolist()})
+    # Serve the (normalized) display subsample. Segmentation still runs full-res.
+    return jsonify({"xyz": disp_norm.flatten().tolist(), "rgb": disp_rgb.flatten().tolist()})
 
 
 @app.route("/clear", methods=["POST"])
 def clear():
-    global prompts, labels, prompt_mask, segment_mask
-    prompts, labels = [], []
-    prompt_mask = None
-    segment_mask = None
+    global cur_full_mask
+    segmenter.new_session()
+    cur_full_mask = None
     return jsonify({"status": "cleared"})
 
 
 @app.route("/next", methods=["POST"])
 def next():
-    global prompts, labels, segment_mask, masks, prompt_mask
-    masks.append(segment_mask.cpu().numpy())
-    prompts, labels = [], []
-    prompt_mask = None
+    global cur_full_mask
+    if cur_full_mask is not None:
+        saved_masks.append(cur_full_mask.copy())
+    segmenter.new_session()
+    cur_full_mask = None
     return jsonify({"status": "cleared"})
 
 
 @app.route("/save", methods=["POST"])
 def save():
     os.makedirs(output_dir, exist_ok=True)
-    global pc_xyz, pc_rgb, segment_mask, obj_path, masks
-    xyz = pc_xyz[0].cpu().numpy()
-    rgb = pc_rgb[0].cpu().numpy()
-    masks = np.stack(masks)
-    obj_path = obj_path.split(".")[0]
-    np.save(f"{output_dir}/{obj_path}.npy", {"xyz": xyz, "rgb": rgb, "mask": masks})
-    global prompts, labels, prompt_mask
-    prompts, labels = [], []
-    prompt_mask = None
-    segment_mask = None
-    return jsonify({"status": "saved"})
+    masks = list(saved_masks)
+    if cur_full_mask is not None:
+        masks.append(cur_full_mask)
+    name = obj_path.split(".")[0]
+    # full-resolution export: per-point xyz/rgb + one boolean mask per object
+    np.save(
+        f"{output_dir}/{name}.npy",
+        {"xyz": xyz_world, "rgb": rgb01, "masks": np.stack(masks) if masks else np.zeros((0, N), bool)},
+    )
+    return jsonify({"status": "saved", "num_objects": len(masks)})
 
 
 @app.route("/segment", methods=["POST"])
 def segment():
+    global cur_full_mask
     request_data = request.get_json()
-    prompt_point = request_data["prompt_point"]
-    prompt_label = request_data["prompt_label"]
+    prompt_label = int(request_data["prompt_label"])
 
-    # append prompt
-    global prompts, labels, prompt_mask
-    prompts.append(prompt_point)
-    labels.append(prompt_label)
+    # Preferred: the browser sends the picked display-point INDEX (exact), so we
+    # recover its world coordinate directly. Fallback: snap a sent coordinate to
+    # the nearest displayed point. Either way we get a real world point, which
+    # routes the prompt to the correct cached tile.
+    if request_data.get("prompt_index") is not None:
+        world = disp_world[int(request_data["prompt_index"])]
+    else:
+        prompt_point = np.array(request_data["prompt_point"], dtype=np.float64).reshape(3)
+        _, nn = disp_tree.query(prompt_point)
+        world = disp_world[nn]
 
-    prompt_points = torch.from_numpy(np.array(prompts)).cuda().float()[None, ...]
-    prompt_labels = torch.from_numpy(np.array(labels)).cuda()[None, ...]
+    full_mask = segmenter.add_prompt(world, prompt_label)  # [N] bool, full-res
+    cur_full_mask = full_mask
 
-    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
-        masks, iou_preds = sam.predict_masks(
-            pc_xyz,
-            pc_rgb,
-            prompt_points,
-            prompt_labels,
-            prompt_mask,
-            multimask_output=prompt_mask is None,
-        )
-    best = torch.argmax(iou_preds[0])
-    prompt_mask = masks[0][best][None, ...]  # raw-logit mask fed back on next click
-    global segment_mask
-    segment_mask = return_mask = masks[0][best] > 0
-    return jsonify({"seg": return_mask.cpu().numpy().tolist()})
+    # Return the mask over the displayed points (browser only knows those).
+    seg_disp = full_mask[disp_idx]
+    return jsonify({"seg": seg_disp.tolist()})
 
 
 if __name__ == "__main__":
-    app.run(host=f"{args.host}", port=f"{args.port}", debug=True)
+    # use_reloader=False so the heavy scene encoding does not run twice.
+    app.run(host=f"{args.host}", port=f"{args.port}", debug=True, use_reloader=False)
