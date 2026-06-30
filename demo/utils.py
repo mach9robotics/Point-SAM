@@ -1,30 +1,27 @@
 import numpy as np
+import trimesh
 
 
 def load_ply(filename):
-    with open(filename, "r") as rf:
-        while True:
-            try:
-                line = rf.readline()
-            except:
-                raise NotImplementedError
-            if "end_header" in line:
-                break
-            if "element vertex" in line:
-                arr = line.split()
-                num_of_points = int(arr[2])
+    """Load a PLY point cloud and return an [N, 6] array of XYZ + RGB (0-255).
 
-        # print("%d points in ply file" %num_of_points)
-        points = np.zeros([num_of_points, 6])
-        for i in range(points.shape[0]):
-            point = rf.readline().split()
-            assert len(point) == 6
-            points[i][0] = float(point[0])
-            points[i][1] = float(point[1])
-            points[i][2] = float(point[2])
-            points[i][3] = float(point[3])
-            points[i][4] = float(point[4])
-            points[i][5] = float(point[5])
-    rf.close()
-    del rf
-    return points
+    Uses trimesh so it handles both ASCII and binary PLY, and tolerates extra
+    vertex properties (e.g. KITTI360 semantic/instance/visible/confidence).
+    """
+    geom = trimesh.load(filename, process=False)
+    xyz = np.asarray(geom.vertices, dtype=np.float64)
+
+    colors = None
+    if getattr(geom, "colors", None) is not None and len(geom.colors) == len(xyz):
+        colors = np.asarray(geom.colors)
+    elif getattr(getattr(geom, "visual", None), "vertex_colors", None) is not None:
+        vc = np.asarray(geom.visual.vertex_colors)
+        if len(vc) == len(xyz):
+            colors = vc
+
+    if colors is None:
+        rgb = np.full((xyz.shape[0], 3), 128.0)  # neutral gray if no color present
+    else:
+        rgb = colors[:, :3].astype(np.float64)
+
+    return np.concatenate([xyz, rgb], axis=1)

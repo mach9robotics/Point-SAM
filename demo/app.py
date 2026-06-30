@@ -19,6 +19,12 @@ parser.add_argument("--port", type=int, default=5000)
 parser.add_argument("--checkpoint", type=str, default="pretrained/model.safetensors")
 parser.add_argument("--pointcloud", type=str, default="scene.ply")
 parser.add_argument(
+    "--num_points",
+    type=int,
+    default=100000,
+    help="randomly subsample the cloud to at most this many points (GPU/browser limit)",
+)
+parser.add_argument(
     "--config", type=str, default="large", help="path to config file"
 )
 parser.add_argument("--config_dir", type=str, default="../configs")
@@ -64,7 +70,8 @@ model.apply(replace_with_fused_layernorm)
 # ---------------------------------------------------------------------------- #
 # Load pre-trained model
 # ---------------------------------------------------------------------------- #
-load_model(model, args.ckpt_path)
+load_model(model, args.checkpoint)
+model.eval().cuda()
 sam = model
 
 
@@ -109,35 +116,37 @@ def sampled_pc():
 
 @app.route("/pointcloud/<path:path>")
 def pointcloud_server(path):
-    path = args.pointcloud
-    global obj_path
-    obj_path = path
-    points = load_ply(f"./demo/static/models/{path}")
+    global obj_path, pc_xyz, pc_rgb
+
+    # Resolve the cloud path: use --pointcloud as given if it exists (absolute or
+    # relative to cwd), otherwise fall back to the bundled demo/static/models dir.
+    src = args.pointcloud
+    if not os.path.exists(src):
+        src = os.path.join(os.path.dirname(__file__), "static", "models", args.pointcloud)
+    obj_path = os.path.basename(args.pointcloud)
+
+    points = load_ply(src)
     xyz = points[:, :3]
     rgb = points[:, 3:6] / 255
-    # print(rgb.max())
-    # indices = np.random.choice(xyz.shape[0], 30000, replace=False)
-    # xyz = xyz[indices]
-    # rgb = rgb[indices]
 
-    # normalize
+    # Subsample large clouds (e.g. multi-million-point LiDAR) to keep the encoder
+    # within GPU memory and the browser payload manageable.
+    if xyz.shape[0] > args.num_points:
+        indices = np.random.choice(xyz.shape[0], args.num_points, replace=False)
+        xyz = xyz[indices]
+        rgb = rgb[indices]
+    print(f"[pointcloud] {src}: serving {xyz.shape[0]} points")
+
+    # normalize to a unit sphere centered at the origin
     shift = xyz.mean(0)
     scale = np.linalg.norm(xyz - shift, axis=-1).max()
     xyz = (xyz - shift) / scale
 
-    # set pcsam variables
-    global pc_xyz, pc_rgb
-    pc_xyz, pc_rgb = (
-        torch.from_numpy(xyz).cuda().float(),
-        torch.from_numpy(rgb).cuda().float(),
-    )
-    pc_xyz, pc_rgb = pc_xyz.unsqueeze(0), pc_rgb.unsqueeze(0)
+    # set pcsam variables (kept aligned with what we send to the browser)
+    pc_xyz = torch.from_numpy(xyz).cuda().float().unsqueeze(0)
+    pc_rgb = torch.from_numpy(rgb).cuda().float().unsqueeze(0)
 
-    # flatten
-    xyz = xyz.flatten()
-    rgb = rgb.flatten()
-
-    return jsonify({"xyz": xyz.tolist(), "rgb": rgb.tolist()})
+    return jsonify({"xyz": xyz.flatten().tolist(), "rgb": rgb.flatten().tolist()})
 
 
 @app.route("/clear", methods=["POST"])
@@ -188,21 +197,19 @@ def segment():
     prompt_points = torch.from_numpy(np.array(prompts)).cuda().float()[None, ...]
     prompt_labels = torch.from_numpy(np.array(labels)).cuda()[None, ...]
 
-    data = {
-        "points": pc_xyz,
-        "rgb": pc_rgb,
-        "prompt_points": prompt_points,
-        "prompt_labels": prompt_labels,
-        "prompt_mask": prompt_mask,
-    }
-    with torch.no_grad():
-        sam.set_pointcloud(pc_xyz, pc_rgb)
-        mask, scores, logits = sam.predict_masks(
-            prompt_points, prompt_labels, prompt_mask, prompt_mask is None
+    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+        masks, iou_preds = sam.predict_masks(
+            pc_xyz,
+            pc_rgb,
+            prompt_points,
+            prompt_labels,
+            prompt_mask,
+            multimask_output=prompt_mask is None,
         )
-    prompt_mask = logits[0][torch.argmax(scores[0])][None, ...]
+    best = torch.argmax(iou_preds[0])
+    prompt_mask = masks[0][best][None, ...]  # raw-logit mask fed back on next click
     global segment_mask
-    segment_mask = return_mask = mask[0][torch.argmax(scores[0])] > 0
+    segment_mask = return_mask = masks[0][best] > 0
     return jsonify({"seg": return_mask.cpu().numpy().tolist()})
 
 
